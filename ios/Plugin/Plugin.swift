@@ -34,13 +34,29 @@ public class BluetoothLe: CAPPlugin {
     }
 
     @objc func initialize(_ call: CAPPluginCall) {
-        self.deviceManager = DeviceManager(self.bridge?.viewController, self.displayStrings, {(success, message) in
-            if success {
-                call.resolve()
-            } else {
-                call.reject(message)
+        let restoreStateIdentifier = call.getString("restoreStateIdentifier")
+        self.deviceManager = DeviceManager(
+            self.bridge?.viewController,
+            self.displayStrings,
+            restoreStateIdentifier,
+            {(success, message) in
+                if success {
+                    call.resolve()
+                } else {
+                    call.reject(message)
+                }
             }
-        })
+        )
+    }
+
+    @objc func getRestoredDevices(_ call: CAPPluginCall) {
+        guard let deviceManager = self.getDeviceManager(call) else { return }
+        let devices = deviceManager.getRestoredDevices()
+        let bleDevices: [BleDevice] = devices.map { device in
+            self.deviceMap[device.getId()] = device
+            return self.getBleDevice(device)
+        }
+        call.resolve(["devices": bleDevices])
     }
 
     @objc func isEnabled(_ call: CAPPluginCall) {
@@ -144,7 +160,7 @@ public class BluetoothLe: CAPPlugin {
             {(success, message) in
                 if success {
                     guard let device = deviceManager.getDevice(message) else {
-                        call.reject("Device not found.")
+                        self.rejectWithError(call, BleError(.deviceNotFound))
                         return
                     }
                     self.deviceMap[device.getId()] = device
@@ -253,9 +269,10 @@ public class BluetoothLe: CAPPlugin {
                 call.reject(message)
             }
         })
-        self.deviceManager?.setOnDisconnected(device, {(_, _) in
+        self.deviceManager?.setOnDisconnected(device, {(_, message) in
             let key = "disconnected|\(device.getId())"
-            self.notifyListeners(key, data: nil)
+            let interrupted = message == "interrupted"
+            self.notifyListeners(key, data: ["interrupted": interrupted])
         })
         self.deviceManager?.connect(device, timeout, {(success, message) in
             if success {
@@ -534,7 +551,7 @@ public class BluetoothLe: CAPPlugin {
 
     private func getDeviceManager(_ call: CAPPluginCall) -> DeviceManager? {
         guard let deviceManager = self.deviceManager else {
-            call.reject("Bluetooth LE not initialized.")
+            rejectWithError(call, BleError(.bluetoothUnavailable, "Bluetooth LE not initialized."))
             return nil
         }
         return deviceManager
@@ -624,16 +641,16 @@ public class BluetoothLe: CAPPlugin {
 
     private func getDevice(_ call: CAPPluginCall, checkConnection: Bool = true) -> Device? {
         guard let deviceId = call.getString("deviceId") else {
-            call.reject("deviceId required.")
+            rejectWithError(call, BleError(.deviceNotFound, "deviceId required."))
             return nil
         }
         guard let device = self.deviceMap[deviceId] else {
-            call.reject("Device not found. Call 'requestDevice', 'requestLEScan' or 'getDevices' first.")
+            rejectWithError(call, BleError(.deviceNotFound, "Device not found. Call 'requestDevice', 'requestLEScan' or 'getDevices' first."))
             return nil
         }
         if checkConnection {
             guard device.isConnected() else {
-                call.reject("Not connected to device.")
+                rejectWithError(call, BleError(.deviceDisconnected, "Not connected to device."))
                 return nil
             }
         }
@@ -649,13 +666,13 @@ public class BluetoothLe: CAPPlugin {
 
     private func getCharacteristic(_ call: CAPPluginCall) -> (CBUUID, CBUUID)? {
         guard let service = call.getString("service") else {
-            call.reject("Service UUID required.")
+            rejectWithError(call, BleError(.serviceNotFound, "Service UUID required."))
             return nil
         }
         let serviceUUID = CBUUID(string: service)
 
         guard let characteristic = call.getString("characteristic") else {
-            call.reject("Characteristic UUID required.")
+            rejectWithError(call, BleError(.characteristicNotFound, "Characteristic UUID required."))
             return nil
         }
         let characteristicUUID = CBUUID(string: characteristic)
@@ -667,7 +684,7 @@ public class BluetoothLe: CAPPlugin {
             return nil
         }
         guard let descriptor = call.getString("descriptor") else {
-            call.reject("Descriptor UUID required.")
+            rejectWithError(call, BleError(.descriptorNotFound, "Descriptor UUID required."))
             return nil
         }
         let descriptorUUID = CBUUID(string: descriptor)
@@ -733,5 +750,12 @@ public class BluetoothLe: CAPPlugin {
             result[cbuuidToString(key)] = dataToString(value)
         }
         return result
+    }
+
+    /// Reject a plugin call with a structured BLE error code.
+    /// The error object will contain both 'code' (numeric) and 'message' fields
+    /// that the application can use for programmatic error handling.
+    private func rejectWithError(_ call: CAPPluginCall, _ error: BleError) {
+        call.reject(error.message, String(error.code.rawValue), nil, error.toDict())
     }
 }

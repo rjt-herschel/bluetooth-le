@@ -30,13 +30,31 @@ class DeviceManager: NSObject, CBCentralManagerDelegate {
     private var allowDuplicates = false
     private var manufacturerDataFilters: [ManufacturerDataFilter]?
     private var serviceDataFilters: [ServiceDataFilter]?
+    private var intentionalDisconnections = Set<String>()
+    private var restoreStateIdentifier: String?
+    private var restoredPeripherals: [CBPeripheral] = []
 
-    init(_ viewController: UIViewController?, _ displayStrings: [String: String], _ callback: @escaping Callback) {
+    init(
+        _ viewController: UIViewController?,
+        _ displayStrings: [String: String],
+        _ restoreStateIdentifier: String? = nil,
+        _ callback: @escaping Callback
+    ) {
         super.init()
         self.viewController = viewController
         self.displayStrings = displayStrings
+        self.restoreStateIdentifier = restoreStateIdentifier
         self.callbackMap["initialize"] = callback
-        self.centralManager = CBCentralManager(delegate: self, queue: DispatchQueue.main)
+
+        var options: [String: Any] = [:]
+        if let identifier = restoreStateIdentifier {
+            options[CBCentralManagerOptionRestoreIdentifierKey] = identifier
+        }
+        self.centralManager = CBCentralManager(
+            delegate: self,
+            queue: DispatchQueue.main,
+            options: options.isEmpty ? nil : options
+        )
     }
 
     func setDisplayStrings(_ displayStrings: [String: String]) {
@@ -323,6 +341,7 @@ class DeviceManager: NSObject, CBCentralManagerDelegate {
             return
         }
         log("Disconnecting from peripheral", device.getPeripheral())
+        intentionalDisconnections.insert(device.getId())
         self.centralManager.cancelPeripheralConnection(device.getPeripheral())
         self.setTimeout(key, "Disconnection timeout.", timeout)
     }
@@ -333,9 +352,19 @@ class DeviceManager: NSObject, CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
-        let key = "disconnect|\(peripheral.identifier.uuidString)"
-        let keyOnDisconnected = "onDisconnected|\(peripheral.identifier.uuidString)"
-        self.resolve(keyOnDisconnected, "Disconnected.")
+        let deviceId = peripheral.identifier.uuidString
+        let wasIntentional = intentionalDisconnections.remove(deviceId) != nil
+
+        let key = "disconnect|\(deviceId)"
+        let keyOnDisconnected = "onDisconnected|\(deviceId)"
+
+        // Pass interrupted flag: true if NOT intentional (unexpected disconnect)
+        let interrupted = !wasIntentional
+        if let callback = self.callbackMap[keyOnDisconnected] {
+            callback(true, interrupted ? "interrupted" : "intentional")
+            self.callbackMap[keyOnDisconnected] = nil
+        }
+
         if error != nil {
             log(error!.localizedDescription)
             self.reject(key, error!.localizedDescription)
@@ -346,6 +375,21 @@ class DeviceManager: NSObject, CBCentralManagerDelegate {
 
     func getDevice(_ deviceId: String) -> Device? {
         return self.discoveredDevices[deviceId]
+    }
+
+    // State restoration delegate method
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        if let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] {
+            self.restoredPeripherals = peripherals
+            for peripheral in peripherals {
+                let device = Device(peripheral)
+                self.discoveredDevices[device.getId()] = device
+            }
+        }
+    }
+
+    func getRestoredDevices() -> [Device] {
+        return restoredPeripherals.map { Device($0) }
     }
 
     private func passesNameFilter(peripheralName: String?) -> Bool {

@@ -95,6 +95,7 @@ class BluetoothLe : Plugin() {
     private var deviceScanner: DeviceScanner? = null
     private var displayStrings: DisplayStrings? = null
     private var aliases: Array<String> = arrayOf()
+    private val intentionalDisconnections = mutableSetOf<String>()
 
     override fun load() {
         displayStrings = getDisplayStrings()
@@ -136,13 +137,13 @@ class BluetoothLe : Plugin() {
         if (granted.all { it }) {
             runInitialization(call)
         } else {
-            call.reject("Permission denied.")
+            rejectWithError(call, BleError(BleErrorCode.PermissionDenied))
         }
     }
 
     private fun runInitialization(call: PluginCall) {
         if (!activity.packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)) {
-            call.reject("BLE is not supported.")
+            rejectWithError(call, BleError(BleErrorCode.BluetoothUnavailable, "BLE is not supported."))
             return
         }
 
@@ -150,7 +151,7 @@ class BluetoothLe : Plugin() {
             (activity.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
 
         if (bluetoothAdapter == null) {
-            call.reject("BLE is not available.")
+            rejectWithError(call, BleError(BleErrorCode.BluetoothUnavailable, "BLE is not available."))
             return
         }
         call.resolve()
@@ -331,7 +332,7 @@ class BluetoothLe : Plugin() {
                 run {
                     if (scanResponse.success) {
                         if (scanResponse.device == null) {
-                            call.reject("No device found.")
+                            rejectWithError(call, BleError(BleErrorCode.DeviceNotFound))
                         } else {
                             val bleDevice = getBleDevice(scanResponse.device)
                             call.resolve(bleDevice)
@@ -460,6 +461,15 @@ class BluetoothLe : Plugin() {
     }
 
     @PluginMethod
+    fun getRestoredDevices(call: PluginCall) {
+        // Android does not support state restoration like iOS.
+        // Return empty list for API compatibility.
+        val result = JSObject()
+        result.put("devices", JSArray())
+        call.resolve(result)
+    }
+
+    @PluginMethod
     fun connect(call: PluginCall) {
         val device = getOrCreateDevice(call) ?: return
         val timeout = call.getFloat("timeout", CONNECTION_TIMEOUT)!!.toLong()
@@ -475,8 +485,13 @@ class BluetoothLe : Plugin() {
     }
 
     private fun onDisconnect(deviceId: String) {
+        val wasIntentional = intentionalDisconnections.remove(deviceId)
+        val interrupted = !wasIntentional
+
         try {
-            notifyListeners("disconnected|${deviceId}", null)
+            val result = JSObject()
+            result.put("interrupted", interrupted)
+            notifyListeners("disconnected|${deviceId}", result)
         } catch (e: ConcurrentModificationException) {
             Logger.error(TAG, "Error in notifyListeners: ${e.localizedMessage}", e)
         }
@@ -510,6 +525,7 @@ class BluetoothLe : Plugin() {
     fun disconnect(call: PluginCall) {
         val device = getOrCreateDevice(call) ?: return
         val timeout = call.getFloat("timeout", DEFAULT_TIMEOUT)!!.toLong()
+        intentionalDisconnections.add(device.getId())
         device.disconnect(timeout) { response ->
             run {
                 if (response.success) {
@@ -802,7 +818,7 @@ class BluetoothLe : Plugin() {
 
     private fun assertBluetoothAdapter(call: PluginCall): Boolean? {
         if (bluetoothAdapter == null) {
-            call.reject("Bluetooth LE not initialized.")
+            rejectWithError(call, BleError(BleErrorCode.BluetoothUnavailable, "Bluetooth LE not initialized."))
             return null
         }
         return true
@@ -1041,7 +1057,7 @@ class BluetoothLe : Plugin() {
         val deviceId = getDeviceId(call) ?: return null
         val device = deviceMap[deviceId]
         if (device == null || !device.isConnected()) {
-            call.reject("Not connected to device.")
+            rejectWithError(call, BleError(BleErrorCode.DeviceDisconnected, "Not connected to device."))
             return null
         }
         return device
@@ -1053,11 +1069,11 @@ class BluetoothLe : Plugin() {
         try {
             serviceUUID = UUID.fromString(serviceString)
         } catch (e: IllegalArgumentException) {
-            call.reject("Invalid service UUID.")
+            rejectWithError(call, BleError(BleErrorCode.ServiceNotFound, "Invalid service UUID."))
             return null
         }
         if (serviceUUID == null) {
-            call.reject("Service UUID required.")
+            rejectWithError(call, BleError(BleErrorCode.ServiceNotFound, "Service UUID required."))
             return null
         }
         val characteristicString = call.getString("characteristic", null)
@@ -1065,11 +1081,11 @@ class BluetoothLe : Plugin() {
         try {
             characteristicUUID = UUID.fromString(characteristicString)
         } catch (e: IllegalArgumentException) {
-            call.reject("Invalid characteristic UUID.")
+            rejectWithError(call, BleError(BleErrorCode.CharacteristicNotFound, "Invalid characteristic UUID."))
             return null
         }
         if (characteristicUUID == null) {
-            call.reject("Characteristic UUID required.")
+            rejectWithError(call, BleError(BleErrorCode.CharacteristicNotFound, "Characteristic UUID required."))
             return null
         }
         return Pair(serviceUUID, characteristicUUID)
@@ -1081,14 +1097,23 @@ class BluetoothLe : Plugin() {
         val descriptorUUID: UUID?
         try {
             descriptorUUID = UUID.fromString(descriptorString)
-        } catch (e: IllegalAccessException) {
-            call.reject("Invalid descriptor UUID.")
+        } catch (e: IllegalArgumentException) {
+            rejectWithError(call, BleError(BleErrorCode.DescriptorNotFound, "Invalid descriptor UUID."))
             return null
         }
         if (descriptorUUID == null) {
-            call.reject("Descriptor UUID required.")
+            rejectWithError(call, BleError(BleErrorCode.DescriptorNotFound, "Descriptor UUID required."))
             return null
         }
         return Triple(characteristic.first, characteristic.second, descriptorUUID)
+    }
+
+    /**
+     * Reject a plugin call with a structured BLE error code.
+     * The error object will contain both 'code' (numeric) and 'message' fields
+     * that the application can use for programmatic error handling.
+     */
+    private fun rejectWithError(call: PluginCall, error: BleError) {
+        call.reject(error.message, error.code.code.toString(), error.toJSObject())
     }
 }
