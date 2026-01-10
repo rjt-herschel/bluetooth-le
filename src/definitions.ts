@@ -12,6 +12,70 @@ export interface InitializeOptions {
    * @default false
    */
   androidNeverForLocation?: boolean;
+  /**
+   * iOS state restoration identifier. When provided, enables background
+   * reconnection support. The app must also have "bluetooth-central"
+   * background mode enabled in Info.plist. (iOS only)
+   *
+   * After a suspended app is relaunched, call getRestoredDevices() to
+   * retrieve previously connected peripherals.
+   */
+  restoreStateIdentifier?: string;
+}
+
+/**
+ * Structured BLE error with code and message.
+ * Allows applications to programmatically handle specific failure modes.
+ */
+export interface BleError {
+  /**
+   * Numeric error code for programmatic handling.
+   * See BleErrorCode enum for values.
+   */
+  code: number;
+  /**
+   * Human-readable error message.
+   */
+  message: string;
+}
+
+/**
+ * BLE error codes for programmatic error handling.
+ */
+export enum BleErrorCode {
+  // General (0-99)
+  UnknownError = 0,
+  BluetoothUnavailable = 1,
+  BluetoothDisabled = 2,
+  PermissionDenied = 3,
+
+  // Scanning (100-199)
+  ScanAlreadyActive = 100,
+  ScanFailed = 101,
+
+  // Connection (200-299)
+  DeviceNotFound = 200,
+  ConnectionFailed = 201,
+  ConnectionTimeout = 202,
+  DeviceDisconnected = 203,
+  UnexpectedDisconnect = 204,
+
+  // Service Discovery (300-399)
+  ServiceNotFound = 300,
+  ServiceDiscoveryFailed = 301,
+  ServiceDiscoveryTimeout = 302,
+
+  // Characteristics (400-499)
+  CharacteristicNotFound = 400,
+  CharacteristicReadFailed = 401,
+  CharacteristicWriteFailed = 402,
+  CharacteristicNotifyFailed = 403,
+  OperationTimeout = 404,
+
+  // Descriptors (500-599)
+  DescriptorNotFound = 500,
+  DescriptorReadFailed = 501,
+  DescriptorWriteFailed = 502,
 }
 
 export interface RequestBleDeviceOptions {
@@ -337,6 +401,19 @@ export interface ScanResult {
   rawAdvertisement?: DataView;
 }
 
+/**
+ * Result from disconnect event listener.
+ * Indicates whether the disconnect was intentional (user-initiated)
+ * or interrupted (unexpected connection drop).
+ */
+export interface DisconnectResult {
+  /**
+   * True if the disconnect was unexpected (connection dropped),
+   * false if the user initiated the disconnect.
+   */
+  interrupted: boolean;
+}
+
 export interface BluetoothLePlugin {
   initialize(options?: InitializeOptions): Promise<void>;
   isEnabled(): Promise<BooleanResult>;
@@ -356,6 +433,12 @@ export interface BluetoothLePlugin {
   getDevices(options: GetDevicesOptions): Promise<GetDevicesResult>;
   getConnectedDevices(options: GetConnectedDevicesOptions): Promise<GetDevicesResult>;
   getBondedDevices(): Promise<GetDevicesResult>;
+  /**
+   * Get devices that were restored from iOS state restoration.
+   * Only available on iOS when restoreStateIdentifier is provided.
+   * Call this after initialize() when the app is relaunched in the background.
+   */
+  getRestoredDevices(): Promise<GetDevicesResult>;
   addListener(
     eventName: 'onEnabledChanged',
     listenerFunc: (result: BooleanResult) => void,
