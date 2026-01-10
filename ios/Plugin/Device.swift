@@ -7,11 +7,12 @@ class Device: NSObject, CBPeripheralDelegate {
 
     private var peripheral: CBPeripheral!
     private var callbackMap = ThreadSafeDictionary<String, Callback>()
-    private var timeoutMap = [String: DispatchWorkItem]()
+    private var timeoutMap = ThreadSafeDictionary<String, DispatchWorkItem>()
     private var servicesCount = 0
     private var servicesDiscovered = 0
     private var characteristicsCount = 0
     private var characteristicsDiscovered = 0
+    private let operationQueue = OperationQueue()
 
     init(
         _ peripheral: CBPeripheral
@@ -177,13 +178,17 @@ class Device: NSObject, CBPeripheralDelegate {
     ) {
         let key = "read|\(serviceUUID.uuidString)|\(characteristicUUID.uuidString)"
         self.callbackMap[key] = callback
-        guard let characteristic = self.getCharacteristic(serviceUUID, characteristicUUID) else {
-            self.reject(key, "Characteristic not found.")
-            return
+
+        self.operationQueue.enqueue { [weak self] _ in
+            guard let self = self else { return }
+            guard let characteristic = self.getCharacteristic(serviceUUID, characteristicUUID) else {
+                self.reject(key, "Characteristic not found.")
+                return
+            }
+            log("Reading value")
+            self.peripheral.readValue(for: characteristic)
+            self.setTimeout(key, "Read timeout.", timeout)
         }
-        log("Reading value")
-        self.peripheral.readValue(for: characteristic)
-        self.setTimeout(key, "Read timeout.", timeout)
     }
 
     func peripheral(
@@ -191,24 +196,38 @@ class Device: NSObject, CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
-        let key = self.getKey("read", characteristic)
+        let readKey = self.getKey("read", characteristic)
         let notifyKey = self.getKey("notification", characteristic)
-        if error != nil {
-            self.reject(key, error!.localizedDescription)
-            return
-        }
-        if characteristic.value == nil {
-            self.reject(key, "Characteristic contains no value.")
-            return
-        }
-        // reading
-        let valueString = dataToString(characteristic.value!)
-        self.resolve(key, valueString)
 
-        // notifications
-        let callback = self.callbackMap[notifyKey]
-        if callback != nil {
-            callback!(true, valueString)
+        // Check if this is a read response or a notification
+        let isReadOperation = self.callbackMap[readKey] != nil
+
+        if error != nil {
+            // Only reject read operations on error - notifications continue
+            if isReadOperation {
+                self.reject(readKey, error!.localizedDescription)
+            }
+            return
+        }
+
+        if characteristic.value == nil {
+            if isReadOperation {
+                self.reject(readKey, "Characteristic contains no value.")
+            }
+            return
+        }
+
+        let valueString = dataToString(characteristic.value!)
+
+        // Handle read operation (resolves and completes queue operation)
+        if isReadOperation {
+            self.resolve(readKey, valueString)
+        }
+
+        // Handle notification (does NOT complete queue operation - notifications are persistent)
+        let notifyCallback = self.callbackMap[notifyKey]
+        if notifyCallback != nil {
+            notifyCallback!(true, valueString)
         }
     }
 
@@ -221,13 +240,17 @@ class Device: NSObject, CBPeripheralDelegate {
     ) {
         let key = "readDescriptor|\(serviceUUID.uuidString)|\(characteristicUUID.uuidString)|\(descriptorUUID.uuidString)"
         self.callbackMap[key] = callback
-        guard let descriptor = self.getDescriptor(serviceUUID, characteristicUUID, descriptorUUID) else {
-            self.reject(key, "Descriptor not found.")
-            return
+
+        self.operationQueue.enqueue { [weak self] _ in
+            guard let self = self else { return }
+            guard let descriptor = self.getDescriptor(serviceUUID, characteristicUUID, descriptorUUID) else {
+                self.reject(key, "Descriptor not found.")
+                return
+            }
+            log("Reading descriptor value")
+            self.peripheral.readValue(for: descriptor)
+            self.setTimeout(key, "Read descriptor timeout.", timeout)
         }
-        log("Reading descriptor value")
-        self.peripheral.readValue(for: descriptor)
-        self.setTimeout(key, "Read descriptor timeout.", timeout)
     }
 
     func peripheral(
@@ -258,16 +281,20 @@ class Device: NSObject, CBPeripheralDelegate {
     ) {
         let key = "write|\(serviceUUID.uuidString)|\(characteristicUUID.uuidString)"
         self.callbackMap[key] = callback
-        guard let characteristic = self.getCharacteristic(serviceUUID, characteristicUUID) else {
-            self.reject(key, "Characteristic not found.")
-            return
-        }
-        let data: Data = stringToData(value)
-        self.peripheral.writeValue(data, for: characteristic, type: writeType)
-        if writeType == CBCharacteristicWriteType.withResponse {
-            self.setTimeout(key, "Write timeout.", timeout)
-        } else {
-            self.resolve(key, "Successfully written value.")
+
+        self.operationQueue.enqueue { [weak self] _ in
+            guard let self = self else { return }
+            guard let characteristic = self.getCharacteristic(serviceUUID, characteristicUUID) else {
+                self.reject(key, "Characteristic not found.")
+                return
+            }
+            let data: Data = stringToData(value)
+            self.peripheral.writeValue(data, for: characteristic, type: writeType)
+            if writeType == CBCharacteristicWriteType.withResponse {
+                self.setTimeout(key, "Write timeout.", timeout)
+            } else {
+                self.resolve(key, "Successfully written value.")
+            }
         }
     }
 
@@ -294,13 +321,17 @@ class Device: NSObject, CBPeripheralDelegate {
     ) {
         let key = "writeDescriptor|\(serviceUUID.uuidString)|\(characteristicUUID.uuidString)|\(descriptorUUID.uuidString)"
         self.callbackMap[key] = callback
-        guard let descriptor = self.getDescriptor(serviceUUID, characteristicUUID, descriptorUUID) else {
-            self.reject(key, "Descriptor not found.")
-            return
+
+        self.operationQueue.enqueue { [weak self] _ in
+            guard let self = self else { return }
+            guard let descriptor = self.getDescriptor(serviceUUID, characteristicUUID, descriptorUUID) else {
+                self.reject(key, "Descriptor not found.")
+                return
+            }
+            let data: Data = stringToData(value)
+            self.peripheral.writeValue(data, for: descriptor)
+            self.setTimeout(key, "Write descriptor timeout.", timeout)
         }
-        let data: Data = stringToData(value)
-        self.peripheral.writeValue(data, for: descriptor)
-        self.setTimeout(key, "Write descriptor timeout.", timeout)
     }
 
     func peripheral(
@@ -330,13 +361,17 @@ class Device: NSObject, CBPeripheralDelegate {
         if notifyCallback != nil {
             self.callbackMap[notifyKey] = notifyCallback
         }
-        guard let characteristic = self.getCharacteristic(serviceUUID, characteristicUUID) else {
-            self.reject(key, "Characteristic not found.")
-            return
+
+        self.operationQueue.enqueue { [weak self] _ in
+            guard let self = self else { return }
+            guard let characteristic = self.getCharacteristic(serviceUUID, characteristicUUID) else {
+                self.reject(key, "Characteristic not found.")
+                return
+            }
+            log("Set notifications", enable)
+            self.peripheral.setNotifyValue(enable, for: characteristic)
+            self.setTimeout(key, "Set notifications timeout.", timeout)
         }
-        log("Set notifications", enable)
-        self.peripheral.setNotifyValue(enable, for: characteristic)
-        self.setTimeout(key, "Set notifications timeout.", timeout)
     }
 
     func peripheral(
@@ -393,6 +428,8 @@ class Device: NSObject, CBPeripheralDelegate {
             self.timeoutMap[key]?.cancel()
             self.timeoutMap[key] = nil
         }
+        // Complete the current queued operation
+        self.operationQueue.completeCurrentOperation()
     }
 
     private func reject(
@@ -407,6 +444,8 @@ class Device: NSObject, CBPeripheralDelegate {
             self.timeoutMap[key]?.cancel()
             self.timeoutMap[key] = nil
         }
+        // Complete the current queued operation
+        self.operationQueue.completeCurrentOperation()
     }
 
     private func setTimeout(

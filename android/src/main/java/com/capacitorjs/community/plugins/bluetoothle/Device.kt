@@ -69,11 +69,13 @@ class Device(
     private var connectionState = STATE_DISCONNECTED
     private var device: BluetoothDevice = bluetoothAdapter.getRemoteDevice(address)
     private var bluetoothGatt: BluetoothGatt? = null
-    private var callbackMap = HashMap<String, ((CallbackResponse) -> Unit)>()
+    private var callbackMap = ConcurrentHashMap<String, ((CallbackResponse) -> Unit)>()
     private val timeoutQueue = ConcurrentLinkedQueue<TimeoutHandler>()
     private var bondStateReceiver: BroadcastReceiver? = null
     private val pendingBondKeys = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     private var currentMtu = -1
+    private val operationQueue = OperationQueue()
+    private var currentOperationCallback: OperationQueue.OperationCallback? = null
 
     private lateinit var callbacksHandlerThread: HandlerThread
     private lateinit var callbacksHandler: Handler
@@ -106,6 +108,8 @@ class Device(
             }
 
             pendingBondKeys.clear()
+            operationQueue.clear()
+            currentOperationCallback = null
             cleanupCallbacksHandlerThread()
         }
     }
@@ -529,18 +533,22 @@ class Device(
     ) {
         val key = "read|$serviceUUID|$characteristicUUID"
         callbackMap[key] = callback
-        val service = bluetoothGatt?.getService(serviceUUID)
-        val characteristic = service?.getCharacteristic(characteristicUUID)
-        if (characteristic == null) {
-            reject(key, "Characteristic not found.")
-            return
+
+        operationQueue.enqueue { opCallback ->
+            currentOperationCallback = opCallback
+            val service = bluetoothGatt?.getService(serviceUUID)
+            val characteristic = service?.getCharacteristic(characteristicUUID)
+            if (characteristic == null) {
+                reject(key, "Characteristic not found.")
+                return@enqueue
+            }
+            val result = bluetoothGatt?.readCharacteristic(characteristic)
+            if (result != true) {
+                reject(key, "Reading characteristic failed.")
+                return@enqueue
+            }
+            setTimeout(key, "Read timeout.", timeout)
         }
-        val result = bluetoothGatt?.readCharacteristic(characteristic)
-        if (result != true) {
-            reject(key, "Reading characteristic failed.")
-            return
-        }
-        setTimeout(key, "Read timeout.", timeout)
     }
 
     fun write(
@@ -553,30 +561,34 @@ class Device(
     ) {
         val key = "write|$serviceUUID|$characteristicUUID"
         callbackMap[key] = callback
-        val service = bluetoothGatt?.getService(serviceUUID)
-        val characteristic = service?.getCharacteristic(characteristicUUID)
-        if (characteristic == null) {
-            reject(key, "Characteristic not found.")
-            return
-        }
-        val bytes = stringToBytes(value)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val statusCode = bluetoothGatt?.writeCharacteristic(characteristic, bytes, writeType)
-            if (statusCode != BluetoothStatusCodes.SUCCESS) {
-                reject(key, "Writing characteristic failed with status code $statusCode.")
-                return
+        operationQueue.enqueue { opCallback ->
+            currentOperationCallback = opCallback
+            val service = bluetoothGatt?.getService(serviceUUID)
+            val characteristic = service?.getCharacteristic(characteristicUUID)
+            if (characteristic == null) {
+                reject(key, "Characteristic not found.")
+                return@enqueue
             }
-        } else {
-            characteristic.value = bytes
-            characteristic.writeType = writeType
-            val result = bluetoothGatt?.writeCharacteristic(characteristic)
-            if (result != true) {
-                reject(key, "Writing characteristic failed.")
-                return
+            val bytes = stringToBytes(value)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val statusCode = bluetoothGatt?.writeCharacteristic(characteristic, bytes, writeType)
+                if (statusCode != BluetoothStatusCodes.SUCCESS) {
+                    reject(key, "Writing characteristic failed with status code $statusCode.")
+                    return@enqueue
+                }
+            } else {
+                characteristic.value = bytes
+                characteristic.writeType = writeType
+                val result = bluetoothGatt?.writeCharacteristic(characteristic)
+                if (result != true) {
+                    reject(key, "Writing characteristic failed.")
+                    return@enqueue
+                }
             }
+            setTimeout(key, "Write timeout.", timeout)
         }
-        setTimeout(key, "Write timeout.", timeout)
     }
 
     fun setNotifications(
@@ -593,67 +605,70 @@ class Device(
         if (notifyCallback != null) {
             callbackMap[notifyKey] = notifyCallback
         }
-        val service = bluetoothGatt?.getService(serviceUUID)
-        val characteristic = service?.getCharacteristic(characteristicUUID)
-        if (characteristic == null) {
-            reject(key, "Characteristic not found.")
-            return
-        }
 
-        val result = bluetoothGatt?.setCharacteristicNotification(characteristic, enable)
-        if (result != true) {
-            reject(key, "Setting notification failed.")
-            return
-        }
+        operationQueue.enqueue { opCallback ->
+            currentOperationCallback = opCallback
+            val service = bluetoothGatt?.getService(serviceUUID)
+            val characteristic = service?.getCharacteristic(characteristicUUID)
+            if (characteristic == null) {
+                reject(key, "Characteristic not found.")
+                return@enqueue
+            }
 
-        val descriptor = characteristic.getDescriptor(UUID.fromString(CLIENT_CHARACTERISTIC_CONFIG))
-        if (descriptor == null) {
-            reject(key, "Setting notification failed.")
-            return
-        }
+            val result = bluetoothGatt?.setCharacteristicNotification(characteristic, enable)
+            if (result != true) {
+                reject(key, "Setting notification failed.")
+                return@enqueue
+            }
 
-        val value = if (enable) {
-            if ((characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
-                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            } else if ((characteristic.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
-                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+            val descriptor = characteristic.getDescriptor(UUID.fromString(CLIENT_CHARACTERISTIC_CONFIG))
+            if (descriptor == null) {
+                reject(key, "Setting notification failed.")
+                return@enqueue
+            }
+
+            val value = if (enable) {
+                if ((characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                } else if ((characteristic.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
+                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                } else {
+                    BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+                }
             } else {
                 BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
             }
-        } else {
-            BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-        }
 
-        // Track this operation as potentially needing bonding
-        if (!isBonded()) {
-            try {
-                ensureBondStateReceiverRegistered()
-                pendingBondKeys.add(key)
-            } catch (e: Exception) {
-                // Don't fail the notification attempt just because bonding
-                // can't be tracked. The call will still timeout if bonding is
-                // required for some reason
-                Logger.warn(TAG, "Error while registering bondStateReceiver: ${e.localizedMessage}")
-            }
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val statusCode = bluetoothGatt?.writeDescriptor(descriptor, value)
-            if (statusCode != BluetoothStatusCodes.SUCCESS) {
-                reject(key, "Setting notification failed with status code $statusCode.")
-                return
-            }
-        } else {
-            descriptor.value = value
-            val resultDesc = bluetoothGatt?.writeDescriptor(descriptor)
-            if (resultDesc != true) {
-                reject(key, "Setting notification failed.")
-                return
+            // Track this operation as potentially needing bonding
+            if (!isBonded()) {
+                try {
+                    ensureBondStateReceiverRegistered()
+                    pendingBondKeys.add(key)
+                } catch (e: Exception) {
+                    // Don't fail the notification attempt just because bonding
+                    // can't be tracked. The call will still timeout if bonding is
+                    // required for some reason
+                    Logger.warn(TAG, "Error while registering bondStateReceiver: ${e.localizedMessage}")
+                }
             }
 
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val statusCode = bluetoothGatt?.writeDescriptor(descriptor, value)
+                if (statusCode != BluetoothStatusCodes.SUCCESS) {
+                    reject(key, "Setting notification failed with status code $statusCode.")
+                    return@enqueue
+                }
+            } else {
+                descriptor.value = value
+                val resultDesc = bluetoothGatt?.writeDescriptor(descriptor)
+                if (resultDesc != true) {
+                    reject(key, "Setting notification failed.")
+                    return@enqueue
+                }
+            }
+            setTimeout(key, "Setting notification timeout.", timeout)
+            // wait for onDescriptorWrite
         }
-        setTimeout(key, "Setting notification timeout.", timeout)
-        // wait for onDescriptorWrite
     }
 
     fun readDescriptor(
@@ -665,23 +680,27 @@ class Device(
     ) {
         val key = "readDescriptor|$serviceUUID|$characteristicUUID|$descriptorUUID"
         callbackMap[key] = callback
-        val service = bluetoothGatt?.getService(serviceUUID)
-        val characteristic = service?.getCharacteristic(characteristicUUID)
-        if (characteristic == null) {
-            reject(key, "Characteristic not found.")
-            return
+
+        operationQueue.enqueue { opCallback ->
+            currentOperationCallback = opCallback
+            val service = bluetoothGatt?.getService(serviceUUID)
+            val characteristic = service?.getCharacteristic(characteristicUUID)
+            if (characteristic == null) {
+                reject(key, "Characteristic not found.")
+                return@enqueue
+            }
+            val descriptor = characteristic.getDescriptor(descriptorUUID)
+            if (descriptor == null) {
+                reject(key, "Descriptor not found.")
+                return@enqueue
+            }
+            val result = bluetoothGatt?.readDescriptor(descriptor)
+            if (result != true) {
+                reject(key, "Reading descriptor failed.")
+                return@enqueue
+            }
+            setTimeout(key, "Read descriptor timeout.", timeout)
         }
-        val descriptor = characteristic.getDescriptor(descriptorUUID)
-        if (descriptor == null) {
-            reject(key, "Descriptor not found.")
-            return
-        }
-        val result = bluetoothGatt?.readDescriptor(descriptor)
-        if (result != true) {
-            reject(key, "Reading descriptor failed.")
-            return
-        }
-        setTimeout(key, "Read descriptor timeout.", timeout)
     }
 
     fun writeDescriptor(
@@ -694,34 +713,38 @@ class Device(
     ) {
         val key = "writeDescriptor|$serviceUUID|$characteristicUUID|$descriptorUUID"
         callbackMap[key] = callback
-        val service = bluetoothGatt?.getService(serviceUUID)
-        val characteristic = service?.getCharacteristic(characteristicUUID)
-        if (characteristic == null) {
-            reject(key, "Characteristic not found.")
-            return
-        }
-        val descriptor = characteristic.getDescriptor(descriptorUUID)
-        if (descriptor == null) {
-            reject(key, "Descriptor not found.")
-            return
-        }
-        val bytes = stringToBytes(value)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val statusCode = bluetoothGatt?.writeDescriptor(descriptor, bytes)
-            if (statusCode != BluetoothStatusCodes.SUCCESS) {
-                reject(key, "Writing descriptor failed with status code $statusCode.")
-                return
+        operationQueue.enqueue { opCallback ->
+            currentOperationCallback = opCallback
+            val service = bluetoothGatt?.getService(serviceUUID)
+            val characteristic = service?.getCharacteristic(characteristicUUID)
+            if (characteristic == null) {
+                reject(key, "Characteristic not found.")
+                return@enqueue
             }
-        } else {
-            descriptor.value = bytes
-            val result = bluetoothGatt?.writeDescriptor(descriptor)
-            if (result != true) {
-                reject(key, "Writing descriptor failed.")
-                return
+            val descriptor = characteristic.getDescriptor(descriptorUUID)
+            if (descriptor == null) {
+                reject(key, "Descriptor not found.")
+                return@enqueue
             }
+            val bytes = stringToBytes(value)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val statusCode = bluetoothGatt?.writeDescriptor(descriptor, bytes)
+                if (statusCode != BluetoothStatusCodes.SUCCESS) {
+                    reject(key, "Writing descriptor failed with status code $statusCode.")
+                    return@enqueue
+                }
+            } else {
+                descriptor.value = bytes
+                val result = bluetoothGatt?.writeDescriptor(descriptor)
+                if (result != true) {
+                    reject(key, "Writing descriptor failed.")
+                    return@enqueue
+                }
+            }
+            setTimeout(key, "Write timeout.", timeout)
         }
-        setTimeout(key, "Write timeout.", timeout)
     }
 
     private fun resolve(key: String, value: String) {
@@ -731,6 +754,8 @@ class Device(
             timeoutQueue.popFirstMatch { it.key == key }?.handler?.removeCallbacksAndMessages(null)
             callback?.invoke(CallbackResponse(true, value))
         }
+        // Complete the current queued operation if this was a queued operation
+        completeCurrentOperation()
     }
 
     private fun reject(key: String, value: String) {
@@ -740,6 +765,13 @@ class Device(
             timeoutQueue.popFirstMatch { it.key == key }?.handler?.removeCallbacksAndMessages(null)
             callback?.invoke(CallbackResponse(false, value))
         }
+        // Complete the current queued operation if this was a queued operation
+        completeCurrentOperation()
+    }
+
+    private fun completeCurrentOperation() {
+        currentOperationCallback?.complete()
+        currentOperationCallback = null
     }
 
     private fun setTimeout(

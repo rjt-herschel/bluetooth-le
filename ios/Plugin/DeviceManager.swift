@@ -15,10 +15,10 @@ class DeviceManager: NSObject, CBCentralManagerDelegate {
     private var centralManager: CBCentralManager!
     private var viewController: UIViewController?
     private var displayStrings: [String: String]!
-    private var callbackMap = [String: Callback]()
+    private var callbackMap = ThreadSafeDictionary<String, Callback>()
     private var scanResultCallback: ScanResultCallback?
     private var stateReceiver: StateReceiver?
-    private var timeoutMap = [String: DispatchWorkItem]()
+    private var timeoutMap = ThreadSafeDictionary<String, DispatchWorkItem>()
     private var stopScanWorkItem: DispatchWorkItem?
     private var alertController: UIAlertController?
     private var deviceListView: DeviceListView?
