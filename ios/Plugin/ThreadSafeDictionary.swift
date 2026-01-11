@@ -10,4 +10,14 @@ class ThreadSafeDictionary<K: Hashable, T> {
             queue.async(flags: .barrier) { self.dictionary[key] = newValue }
         }
     }
+
+    /// Get all keys in the dictionary.
+    var allKeys: [K] {
+        return queue.sync { Array(dictionary.keys) }
+    }
+
+    /// Get all values in the dictionary.
+    var allValues: [T] {
+        return queue.sync { Array(dictionary.values) }
+    }
 }

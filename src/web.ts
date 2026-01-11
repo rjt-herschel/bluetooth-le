@@ -184,6 +184,12 @@ export class BluetoothLeWeb extends WebPlugin implements BluetoothLePlugin {
     return {} as Promise<GetDevicesResult>;
   }
 
+  async getRestoredDevices(): Promise<GetDevicesResult> {
+    // State restoration is not available on web.
+    // Return empty list for API compatibility.
+    return { devices: [] };
+  }
+
   async connect(options: DeviceIdOptions & TimeoutOptions): Promise<void> {
     const device = this.getDeviceFromMap(options.deviceId);
     device.removeEventListener('gattserverdisconnected', this.onDisconnectedCallback);
